@@ -7,3 +7,4 @@ relayer/scripts/node_modules/
 
 cli/node_modules/
 cli/dist/
+cli/.env
