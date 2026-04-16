@@ -7,11 +7,14 @@ type CaptureOptions = {
   namespace: string;
   metadata: MemoryMetadata;
   summary?: string;
+  includeDetailedContext?: boolean;
+  detailedChunkBytes?: number;
 };
 
 export type CapturedContext = {
   summary: RememberFactInput;
   facts: RememberFactInput[];
+  detailedContext: RememberFactInput[];
 };
 
 function runGit(args: string[], cwd: string): string {
@@ -38,13 +41,14 @@ function collectTouchedFiles(cwd: string): string[] {
 
   return output
     .split(/\r?\n/)
-    .filter((line) => line.trim().length > 0)
+    .filter((line) => line.length > 0)
     .map((line) => {
       const renamedIndex = line.indexOf(" -> ");
       if (renamedIndex !== -1) {
         return line.slice(renamedIndex + 4).trim();
       }
-      return line.slice(3).trim();
+      const matched = line.match(/^(?:.. |.\s)(.*)$/);
+      return (matched?.[1] ?? line).trim();
     })
     .filter(Boolean);
 }
@@ -85,6 +89,52 @@ function withFactType(metadata: MemoryMetadata, factType: string): MemoryMetadat
   };
 }
 
+function chunkTextByBytes(text: string, maxBytes: number): string[] {
+  if (Buffer.byteLength(text, "utf8") <= maxBytes) {
+    return [text];
+  }
+
+  const lines = text.split("\n");
+  const chunks: string[] = [];
+  let current = "";
+
+  for (const line of lines) {
+    const candidate = current.length > 0 ? `${current}\n${line}` : line;
+    if (Buffer.byteLength(candidate, "utf8") <= maxBytes) {
+      current = candidate;
+      continue;
+    }
+
+    if (current.length > 0) {
+      chunks.push(current);
+      current = "";
+    }
+
+    if (Buffer.byteLength(line, "utf8") <= maxBytes) {
+      current = line;
+      continue;
+    }
+
+    let partial = "";
+    for (const char of line) {
+      const next = `${partial}${char}`;
+      if (Buffer.byteLength(next, "utf8") > maxBytes) {
+        chunks.push(partial);
+        partial = char;
+      } else {
+        partial = next;
+      }
+    }
+    current = partial;
+  }
+
+  if (current.length > 0) {
+    chunks.push(current);
+  }
+
+  return chunks;
+}
+
 export function captureStructuredContext(options: CaptureOptions): CapturedContext {
   const repoRoot = tryGit(["rev-parse", "--show-toplevel"], options.cwd) ?? options.cwd;
   const branch = tryGit(["branch", "--show-current"], options.cwd) ?? "unknown";
@@ -92,6 +142,8 @@ export function captureStructuredContext(options: CaptureOptions): CapturedConte
   const head = tryGit(["rev-parse", "HEAD"], options.cwd) ?? "unknown";
   const touchedFiles = collectTouchedFiles(options.cwd);
   const dirty = touchedFiles.length > 0;
+  const statusPorcelain = tryGit(["status", "--porcelain"], options.cwd) ?? "";
+  const recentCommits = tryGit(["log", "--oneline", "-5"], options.cwd) ?? "";
 
   const summaryParts = [
     options.summary ? `Task summary: ${options.summary}.` : null,
@@ -150,5 +202,36 @@ export function captureStructuredContext(options: CaptureOptions): CapturedConte
     });
   }
 
-  return { summary, facts };
+  const detailedContext: RememberFactInput[] = [];
+  if (options.includeDetailedContext) {
+    const detailedSections = [
+      `Task Summary\n${options.summary ?? "(none)"}`,
+      `Repository Root\n${repoRoot}`,
+      `Branch\n${branch}`,
+      `Head\n${head}`,
+      `Origin Remote\n${remoteUrl}`,
+      `Git Status Porcelain\n${statusPorcelain || "(clean)"}`,
+      `Touched Files\n${touchedFiles.join("\n") || "(none)"}`,
+      `Recent Commits\n${recentCommits || "(none)"}`,
+    ];
+    const detailedText = detailedSections.join("\n\n");
+    const maxChunkBytes = options.detailedChunkBytes ?? 12_000;
+    const chunks = chunkTextByBytes(detailedText, maxChunkBytes);
+
+    chunks.forEach((chunk, index) => {
+      detailedContext.push({
+        text: `Detailed context chunk ${index + 1}/${chunks.length}\n${chunk}`,
+        namespace: options.namespace,
+        metadata: {
+          ...withFactType(options.metadata, "detailed_context_chunk"),
+          tags: [
+            ...(options.metadata.tags ?? []),
+            `chunk:${index + 1}/${chunks.length}`,
+          ],
+        },
+      });
+    });
+  }
+
+  return { summary, facts, detailedContext };
 }

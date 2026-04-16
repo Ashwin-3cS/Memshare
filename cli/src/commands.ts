@@ -82,7 +82,7 @@ export function printHelp(): void {
   console.log("  help");
   console.log("  status");
   console.log("  health");
-  console.log("  capture [--push] [--summary <text>]");
+  console.log("  capture [--push] [--summary <text>] [--include-detailed-context]");
   console.log("  remember-batch --file <facts.json>");
   console.log("  recall <query> [--namespace <name>]");
   console.log("");
@@ -90,6 +90,8 @@ export function printHelp(): void {
   console.log("  --project-id <id>");
   console.log("  --capsule-id <id>");
   console.log("  --task-id <id>");
+  console.log("  --chunk-bytes <n>");
+  console.log("  --include-detailed-context");
 }
 
 export function runStatus(config: CliConfig): number {
@@ -145,9 +147,13 @@ export async function runCommand(config: CliConfig, argv: string[]): Promise<num
         namespace,
         metadata: buildMetadata(flags),
         summary,
+        includeDetailedContext: flags["include-detailed-context"] === true,
+        detailedChunkBytes: getStringFlag(flags, "chunk-bytes")
+          ? Number.parseInt(getStringFlag(flags, "chunk-bytes")!, 10)
+          : undefined,
       });
       const batch = {
-        facts: [captured.summary, ...captured.facts],
+        facts: [captured.summary, ...captured.facts, ...captured.detailedContext],
       };
 
       if (flags.push === true) {
