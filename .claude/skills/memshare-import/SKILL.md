@@ -1,70 +1,44 @@
 ---
 name: memshare-import
-description: Use when Claude Code needs to import or publish Memshare project context through the local memshare CLI. This skill captures current repo context, pushes it to the Memshare relayer, and rehydrates recalled project context back into the current Claude workflow.
+description: Import project context from Memshare into the current Claude session. Use when a user wants to load context from another agent, session, or collaborator.
 ---
 
 # Memshare Import
 
-Use this skill when you need to move project context between coding sessions with the local `memshare` CLI.
+Use this skill to pull stored project context from the Memshare relayer into the current session.
 
 ## When To Use
 
-- A user wants to save the current working context for later use.
-- A user wants to import stored project context into the current Claude Code session.
-- A task needs handoff context from a prior Codex or Claude session.
+- User says "import memshare context", "get context from friend", "load shared context", "what did we build last session"
+- A handoff is happening from another agent or developer
 
-## Required Assumptions
+## Steps
 
-- Run commands from the target project root.
-- The `memshare` CLI is installed and available on `PATH`, or can be run from this repo with `npm run dev --`.
-- The Memshare relayer is reachable from the configured CLI environment.
-
-## Publish Current Context
-
-Capture and push the current project context:
+1. Run the import command from the project root:
 
 ```bash
-memshare capture \
-  --push \
-  --namespace memshare-e2e \
-  --project-id <project-id> \
-  --capsule-id <capsule-id> \
-  --task-id <task-id> \
-  --source-tool claude-code \
-  --summary "<what this session is doing>" \
-  --include-detailed-context
+node /home/ashwin/projects/memwal-cli/cli/dist/index.js import
 ```
 
-Use `--chunk-bytes <n>` if the detailed context needs smaller chunks.
-
-## Import Stored Context
-
-Rehydrate stored context back into the current Claude session:
+To import a specific project (e.g. from a collaborator):
 
 ```bash
-memshare rehydrate "project context" \
-  --namespace memshare-e2e \
-  --project-id <project-id> \
-  --task-id <task-id>
+node /home/ashwin/projects/memwal-cli/cli/dist/index.js import owner/project-name
 ```
 
-The command returns one rendered project-context artifact with:
+2. Read the index file to understand what was imported:
 
-- summary
-- task summary
-- project context facts
-- working tree facts
-- detailed context if it was stored
+```bash
+cat .memshare/context/index.md
+```
 
-## Workflow
+3. Read only the files relevant to the current task — do not load all files at once.
 
-1. Confirm the project and task identifiers to use.
-2. Run `memshare rehydrate ...` for imports or `memshare capture --push ...` for exports.
-3. Insert the returned artifact into the active Claude reasoning context.
-4. Treat the imported artifact as project memory, not as blindly trusted source-of-truth. Cross-check code state when needed.
+4. Tell the user what context is available and what the project state is.
 
 ## Notes
 
-- `recall` returns decrypted plaintext from the trusted relayer path. The CLI does not decrypt blobs locally in the current implementation.
-- `rehydrate` is the preferred import command for Claude because it assembles the recalled entries into one readable project-context artifact.
-- If the relayer is down, fix the relayer first instead of fabricating context.
+- Context folder is written to `.memshare/context/` by default
+- `index.md` is the entry point — read it first, it costs ~150 tokens
+- Each file focuses on one topic: overview, state, decisions, next-steps, files, git
+- The relayer must be running and reachable from the CLI environment

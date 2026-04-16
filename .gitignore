@@ -9,3 +9,6 @@ cli/node_modules/
 cli/dist/
 cli/.env
 cli/.claude/memshare-context.md
+
+.memshare.json
+.memshare/context/
