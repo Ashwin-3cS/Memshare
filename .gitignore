@@ -1,0 +1,9 @@
+.codex
+.DS_Store
+
+relayer/.env
+relayer/target/
+relayer/scripts/node_modules/
+
+cli/node_modules/
+cli/dist/
