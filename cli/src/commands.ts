@@ -104,8 +104,9 @@ export function printHelp(): void {
   console.log("memshare");
   console.log("");
   console.log("Simple commands (auto-detect project from git):");
+  console.log("  init [--relayer-url <url>] [--account-id <id>] ...  (writes .env)");
   console.log("  publish [--summary <text>] [--context-file <path>] [--stdin]");
-  console.log("  import [<project-id>] [--output <dir>] [--tool claude]");
+  console.log("  import [<project-id>] [--from <account-id>] [--output <dir>] [--tool claude]");
   console.log("  export [<project-id>] [--output <dir>]");
   console.log("  share --to <0xaddress> --pubkey <hex> [--label <name>]");
   console.log("");
@@ -169,6 +170,47 @@ export async function runCommand(config: CliConfig, argv: string[]): Promise<num
       const client = MemshareClient.fromConfig(config);
       const result = await client.health();
       console.log(JSON.stringify(result, null, 2));
+      return 0;
+    }
+    case "init": {
+      const envPath = path.join(process.cwd(), ".env");
+      const relayerUrl = getStringFlag(flags, "relayer-url");
+      const accountId = getStringFlag(flags, "account-id");
+      const delegateKey = getStringFlag(flags, "delegate-key");
+      const suiPrivateKey = getStringFlag(flags, "sui-private-key");
+      const packageId = getStringFlag(flags, "package-id");
+      const registryId = getStringFlag(flags, "registry-id");
+      const suiNetwork = getStringFlag(flags, "network") ?? "mainnet";
+
+      const lines = [
+        `MEMSHARE_RELAYER_URL=${relayerUrl ?? "http://localhost:8010"}`,
+        `MEMWAL_ACCOUNT_ID=${accountId ?? ""}`,
+        `MEMWAL_DELEGATE_KEY=${delegateKey ?? ""}`,
+        `SUI_PRIVATE_KEY=${suiPrivateKey ?? ""}`,
+        `MEMWAL_PACKAGE_ID=${packageId ?? ""}`,
+        `MEMWAL_REGISTRY_ID=${registryId ?? ""}`,
+        `SUI_NETWORK=${suiNetwork}`,
+      ];
+
+      if (fs.existsSync(envPath) && !flags.force) {
+        console.log(`.env already exists at ${envPath}`);
+        console.log("Use --force to overwrite, or edit it manually.");
+        return 1;
+      }
+
+      fs.writeFileSync(envPath, lines.join("\n") + "\n", "utf8");
+      console.log(`Wrote ${envPath}`);
+
+      const missing = lines
+        .filter((l) => l.endsWith("="))
+        .map((l) => l.split("=")[0]);
+      if (missing.length > 0) {
+        console.log("");
+        console.log("Fill in these missing values:");
+        for (const key of missing) console.log(`  ${key}`);
+      } else {
+        console.log("Run: memshare status  (to verify config)");
+      }
       return 0;
     }
     case "publish": {
