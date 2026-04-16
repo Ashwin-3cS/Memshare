@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 
+import { attachContext } from "./attach.js";
 import { captureStructuredContext } from "./capture.js";
 import { type CliConfig, getMissingConfigKeys } from "./config.js";
 import { MemshareClient } from "./client.js";
@@ -90,6 +91,7 @@ export function printHelp(): void {
   console.log("  remember-batch --file <facts.json>");
   console.log("  recall <query> [--namespace <name>]");
   console.log("  rehydrate <query> [--namespace <name>]");
+  console.log("  attach --tool claude <query> [--namespace <name>] [--output <path>]");
   console.log("");
   console.log("Shared filter flags:");
   console.log("  --project-id <id>");
@@ -229,6 +231,37 @@ export async function runCommand(config: CliConfig, argv: string[]): Promise<num
 
       const artifact = rehydrateProjectContext(result);
       console.log(formatProjectContextArtifact(artifact));
+      return 0;
+    }
+    case "attach": {
+      const client = MemshareClient.fromConfig(config);
+      const tool = getStringFlag(flags, "tool");
+      if (tool !== "claude") {
+        throw new Error("attach requires --tool claude");
+      }
+
+      const query = positional.join(" ").trim();
+      if (!query) {
+        throw new Error("attach requires a query string");
+      }
+
+      const namespace = getStringFlag(flags, "namespace") ?? "default";
+      const limitFlag = getStringFlag(flags, "limit");
+      const limit = limitFlag ? Number.parseInt(limitFlag, 10) : 20;
+
+      const result = await client.recall({
+        query,
+        namespace,
+        limit,
+        filters: buildFilters(flags),
+      });
+
+      const attached = attachContext(result, {
+        tool,
+        outputPath: getStringFlag(flags, "output"),
+        cwd: process.cwd(),
+      });
+      console.log(attached.path);
       return 0;
     }
     default:
