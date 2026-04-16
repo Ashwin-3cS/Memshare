@@ -14,27 +14,37 @@ Use this skill to capture the current session state and push it to the Memshare 
 
 ## Steps
 
-1. Generate a narrative summary of the current session. Include:
-   - What the project does
-   - What was built or changed today
-   - Key decisions made and why
-   - Current blockers or open questions
-   - What to do next
+1. Read the codebase to gather real context — do NOT summarize from memory:
+   - `git log --oneline -20` — recent work
+   - `git diff HEAD~3..HEAD --stat` — what changed
+   - Read all source files in `src/` or equivalent (every `.ts`, `.rs`, `.py` etc.)
+   - Read key config files (`.env.example`, `Cargo.toml`, `package.json`, etc.)
+   - Read any existing docs (`README.md`, `docs/`, `CLAUDE.md`)
 
-2. Write the narrative to a temp file:
+2. Write a comprehensive narrative covering:
+   - What the project is and does (architecture, tech stack)
+   - Every major component and what it does
+   - What was built or changed recently (with specifics — function names, file paths)
+   - Key decisions made and why
+   - Current state: what works, what's broken, what's incomplete
+   - How to run / set up the project
+   - What to do next / open questions
+
+3. Write the narrative to `.memshare/<project-name>.md` in the repo root:
 
 ```bash
-cat > /tmp/memshare-narrative.md << 'EOF'
+mkdir -p .memshare
+cat > .memshare/<project-name>.md << 'EOF'
 [narrative text here]
 EOF
 ```
 
-3. Run the publish command:
+4. Run the publish command:
 
 ```bash
-node /home/ashwin/projects/memwal-cli/cli/dist/index.js publish \
+memshare publish \
   --summary "<one-line summary>" \
-  --context-file /tmp/memshare-narrative.md
+  --context-file .memshare/<project-name>.md
 ```
 
 4. Report back to the user:
