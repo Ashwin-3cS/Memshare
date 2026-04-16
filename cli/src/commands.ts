@@ -3,15 +3,23 @@ import path from "node:path";
 
 import { attachContext } from "./attach.js";
 import { captureStructuredContext } from "./capture.js";
-import { type CliConfig, getMissingConfigKeys } from "./config.js";
-import { MemshareClient } from "./client.js";
 import {
+  type CliConfig,
+  getMissingConfigKeys,
+  loadProjectConfig,
+  saveProjectConfig,
+} from "./config.js";
+import { MemshareClient } from "./client.js";
+import { writeContextFolder } from "./export.js";
+import {
+  buildContextFolder,
   formatProjectContextArtifact,
   rehydrateProjectContext,
 } from "./rehydrate.js";
 import type {
   MemoryMetadata,
   MemoryQueryFilters,
+  ProjectConfig,
   RememberBatchRequest,
 } from "./types.js";
 
@@ -53,23 +61,23 @@ function readJsonFile<T>(filePath: string): T {
   return JSON.parse(content) as T;
 }
 
-function buildFilters(flags: FlagMap): MemoryQueryFilters {
+function buildFilters(flags: FlagMap, proj?: ProjectConfig): MemoryQueryFilters {
   return {
-    project_id: getStringFlag(flags, "project-id"),
-    capsule_id: getStringFlag(flags, "capsule-id"),
+    project_id: getStringFlag(flags, "project-id") ?? proj?.projectId,
+    capsule_id: getStringFlag(flags, "capsule-id") ?? proj?.capsuleId,
     task_id: getStringFlag(flags, "task-id"),
   };
 }
 
-function buildMetadata(flags: FlagMap): MemoryMetadata {
+function buildMetadata(flags: FlagMap, proj?: ProjectConfig): MemoryMetadata {
   const tags = getStringFlag(flags, "tags")
     ?.split(",")
     .map((tag) => tag.trim())
     .filter(Boolean);
 
   return {
-    project_id: getStringFlag(flags, "project-id"),
-    capsule_id: getStringFlag(flags, "capsule-id"),
+    project_id: getStringFlag(flags, "project-id") ?? proj?.projectId,
+    capsule_id: getStringFlag(flags, "capsule-id") ?? proj?.capsuleId,
     task_id: getStringFlag(flags, "task-id"),
     fact_type: getStringFlag(flags, "fact-type"),
     source_tool: getStringFlag(flags, "source-tool"),
@@ -80,25 +88,40 @@ function buildMetadata(flags: FlagMap): MemoryMetadata {
   };
 }
 
+function readNarrativeText(flags: FlagMap): string | undefined {
+  const contextFile = getStringFlag(flags, "context-file");
+  if (contextFile) {
+    return fs.readFileSync(path.resolve(process.cwd(), contextFile), "utf8");
+  }
+  if (flags.stdin === true) {
+    return fs.readFileSync("/dev/stdin", "utf8");
+  }
+  return undefined;
+}
+
 export function printHelp(): void {
   console.log("memshare");
   console.log("");
-  console.log("Commands:");
-  console.log("  help");
-  console.log("  status");
-  console.log("  health");
+  console.log("Simple commands (auto-detect project from git):");
+  console.log("  publish [--summary <text>] [--context-file <path>] [--stdin]");
+  console.log("  import [<project-id>] [--output <dir>] [--tool claude]");
+  console.log("  export [<project-id>] [--output <dir>]");
+  console.log("");
+  console.log("Advanced commands:");
   console.log("  capture [--push] [--summary <text>] [--include-detailed-context]");
   console.log("  remember-batch --file <facts.json>");
   console.log("  recall <query> [--namespace <name>]");
   console.log("  rehydrate <query> [--namespace <name>]");
   console.log("  attach --tool claude <query> [--namespace <name>] [--output <path>]");
+  console.log("  health");
+  console.log("  status");
   console.log("");
-  console.log("Shared filter flags:");
-  console.log("  --project-id <id>");
+  console.log("Shared filter flags (advanced):");
+  console.log("  --project-id <id>  (overrides auto-detected project)");
   console.log("  --capsule-id <id>");
   console.log("  --task-id <id>");
+  console.log("  --namespace <name>");
   console.log("  --chunk-bytes <n>");
-  console.log("  --include-detailed-context");
 }
 
 export function runStatus(config: CliConfig): number {
@@ -146,14 +169,129 @@ export async function runCommand(config: CliConfig, argv: string[]): Promise<num
       console.log(JSON.stringify(result, null, 2));
       return 0;
     }
-    case "capture": {
-      const namespace = getStringFlag(flags, "namespace") ?? "default";
+    case "publish": {
+      const proj = loadProjectConfig(process.cwd());
+      const capsuleId =
+        getStringFlag(flags, "capsule-id") ??
+        `${proj.namespace}-${Date.now()}`;
+      const namespace = getStringFlag(flags, "namespace") ?? proj.namespace;
       const summary = getStringFlag(flags, "summary");
+      const narrativeText = readNarrativeText(flags);
+
+      const metadata = buildMetadata(flags, {
+        ...proj,
+        capsuleId,
+      });
+
       const captured = captureStructuredContext({
         cwd: process.cwd(),
         namespace,
-        metadata: buildMetadata(flags),
+        metadata,
         summary,
+        narrativeText,
+        includeDetailedContext: true,
+        detailedChunkBytes: getStringFlag(flags, "chunk-bytes")
+          ? Number.parseInt(getStringFlag(flags, "chunk-bytes")!, 10)
+          : undefined,
+      });
+
+      const batch = {
+        facts: [captured.summary, ...captured.facts, ...captured.detailedContext],
+      };
+
+      const client = MemshareClient.fromConfig(config);
+      const result = await client.rememberBatch(batch);
+
+      saveProjectConfig({ ...proj, capsuleId }, process.cwd());
+
+      console.log(`Published.`);
+      console.log(`  Project:  ${proj.projectId}`);
+      console.log(`  Capsule:  ${capsuleId}`);
+      console.log(`  Facts:    ${result.total}`);
+      return 0;
+    }
+    case "export": {
+      const client = MemshareClient.fromConfig(config);
+      const projectIdArg = positional[0];
+      const proj = projectIdArg
+        ? { projectId: projectIdArg, namespace: projectIdArg.split("/").at(-1) ?? projectIdArg }
+        : loadProjectConfig(process.cwd());
+
+      const namespace = getStringFlag(flags, "namespace") ?? proj.namespace;
+      const result = await client.recall({
+        query: "project context overview decisions state",
+        namespace,
+        limit: 100,
+        filters: { project_id: proj.projectId },
+      });
+
+      const context = rehydrateProjectContext(result);
+      const capturedAt = new Date().toISOString().slice(0, 10);
+      const folder = buildContextFolder(context, proj.projectId, capturedAt);
+
+      const outputDir = path.resolve(
+        process.cwd(),
+        getStringFlag(flags, "output") ?? ".memshare/context",
+      );
+      const exported = writeContextFolder(folder, outputDir);
+
+      console.log(`Exported context folder: ${exported.outputDir}`);
+      console.log(`  ${exported.files.length} files written`);
+      console.log(`  Read ${path.join(exported.outputDir, "index.md")} first`);
+      return 0;
+    }
+    case "import": {
+      const client = MemshareClient.fromConfig(config);
+      const projectIdArg = positional[0];
+      const proj = projectIdArg
+        ? { projectId: projectIdArg, namespace: projectIdArg.split("/").at(-1) ?? projectIdArg }
+        : loadProjectConfig(process.cwd());
+
+      const namespace = getStringFlag(flags, "namespace") ?? proj.namespace;
+      const result = await client.recall({
+        query: "project context overview decisions state",
+        namespace,
+        limit: 100,
+        filters: { project_id: proj.projectId },
+      });
+
+      const context = rehydrateProjectContext(result);
+      const capturedAt = new Date().toISOString().slice(0, 10);
+      const folder = buildContextFolder(context, proj.projectId, capturedAt);
+
+      const outputDir = path.resolve(
+        process.cwd(),
+        getStringFlag(flags, "output") ?? ".memshare/context",
+      );
+      const exported = writeContextFolder(folder, outputDir);
+
+      if (getStringFlag(flags, "tool") === "claude") {
+        const singleFile = path.join(process.cwd(), ".claude", "memshare-context.md");
+        fs.mkdirSync(path.dirname(singleFile), { recursive: true });
+        fs.writeFileSync(
+          singleFile,
+          `<!-- Generated by memshare import --tool claude -->\n<!-- Full context folder: ${outputDir} -->\n\n${folder.index}\n`,
+          "utf8",
+        );
+        console.log(`Claude context: ${singleFile}`);
+      }
+
+      console.log(`Imported context folder: ${exported.outputDir}`);
+      console.log(`  ${exported.files.length} files written`);
+      console.log(`  Read ${path.join(exported.outputDir, "index.md")} first`);
+      return 0;
+    }
+    case "capture": {
+      const proj = loadProjectConfig(process.cwd());
+      const namespace = getStringFlag(flags, "namespace") ?? proj.namespace;
+      const summary = getStringFlag(flags, "summary");
+      const narrativeText = readNarrativeText(flags);
+      const captured = captureStructuredContext({
+        cwd: process.cwd(),
+        namespace,
+        metadata: buildMetadata(flags, proj),
+        summary,
+        narrativeText,
         includeDetailedContext: flags["include-detailed-context"] === true,
         detailedChunkBytes: getStringFlag(flags, "chunk-bytes")
           ? Number.parseInt(getStringFlag(flags, "chunk-bytes")!, 10)
@@ -198,7 +336,8 @@ export async function runCommand(config: CliConfig, argv: string[]): Promise<num
         throw new Error("recall requires a query string");
       }
 
-      const namespace = getStringFlag(flags, "namespace") ?? "default";
+      const proj = loadProjectConfig(process.cwd());
+      const namespace = getStringFlag(flags, "namespace") ?? proj.namespace;
       const limitFlag = getStringFlag(flags, "limit");
       const limit = limitFlag ? Number.parseInt(limitFlag, 10) : undefined;
 
@@ -206,7 +345,7 @@ export async function runCommand(config: CliConfig, argv: string[]): Promise<num
         query,
         namespace,
         limit,
-        filters: buildFilters(flags),
+        filters: buildFilters(flags, proj),
       });
       console.log(JSON.stringify(result, null, 2));
       return 0;
@@ -218,7 +357,8 @@ export async function runCommand(config: CliConfig, argv: string[]): Promise<num
         throw new Error("rehydrate requires a query string");
       }
 
-      const namespace = getStringFlag(flags, "namespace") ?? "default";
+      const proj = loadProjectConfig(process.cwd());
+      const namespace = getStringFlag(flags, "namespace") ?? proj.namespace;
       const limitFlag = getStringFlag(flags, "limit");
       const limit = limitFlag ? Number.parseInt(limitFlag, 10) : 20;
 
@@ -226,7 +366,7 @@ export async function runCommand(config: CliConfig, argv: string[]): Promise<num
         query,
         namespace,
         limit,
-        filters: buildFilters(flags),
+        filters: buildFilters(flags, proj),
       });
 
       const artifact = rehydrateProjectContext(result);
@@ -245,7 +385,8 @@ export async function runCommand(config: CliConfig, argv: string[]): Promise<num
         throw new Error("attach requires a query string");
       }
 
-      const namespace = getStringFlag(flags, "namespace") ?? "default";
+      const proj = loadProjectConfig(process.cwd());
+      const namespace = getStringFlag(flags, "namespace") ?? proj.namespace;
       const limitFlag = getStringFlag(flags, "limit");
       const limit = limitFlag ? Number.parseInt(limitFlag, 10) : 20;
 
@@ -253,7 +394,7 @@ export async function runCommand(config: CliConfig, argv: string[]): Promise<num
         query,
         namespace,
         limit,
-        filters: buildFilters(flags),
+        filters: buildFilters(flags, proj),
       });
 
       const attached = attachContext(result, {
