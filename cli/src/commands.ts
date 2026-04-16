@@ -4,6 +4,10 @@ import path from "node:path";
 import { captureStructuredContext } from "./capture.js";
 import { type CliConfig, getMissingConfigKeys } from "./config.js";
 import { MemshareClient } from "./client.js";
+import {
+  formatProjectContextArtifact,
+  rehydrateProjectContext,
+} from "./rehydrate.js";
 import type {
   MemoryMetadata,
   MemoryQueryFilters,
@@ -85,6 +89,7 @@ export function printHelp(): void {
   console.log("  capture [--push] [--summary <text>] [--include-detailed-context]");
   console.log("  remember-batch --file <facts.json>");
   console.log("  recall <query> [--namespace <name>]");
+  console.log("  rehydrate <query> [--namespace <name>]");
   console.log("");
   console.log("Shared filter flags:");
   console.log("  --project-id <id>");
@@ -202,6 +207,28 @@ export async function runCommand(config: CliConfig, argv: string[]): Promise<num
         filters: buildFilters(flags),
       });
       console.log(JSON.stringify(result, null, 2));
+      return 0;
+    }
+    case "rehydrate": {
+      const client = MemshareClient.fromConfig(config);
+      const query = positional.join(" ").trim();
+      if (!query) {
+        throw new Error("rehydrate requires a query string");
+      }
+
+      const namespace = getStringFlag(flags, "namespace") ?? "default";
+      const limitFlag = getStringFlag(flags, "limit");
+      const limit = limitFlag ? Number.parseInt(limitFlag, 10) : 20;
+
+      const result = await client.recall({
+        query,
+        namespace,
+        limit,
+        filters: buildFilters(flags),
+      });
+
+      const artifact = rehydrateProjectContext(result);
+      console.log(formatProjectContextArtifact(artifact));
       return 0;
     }
     default:
