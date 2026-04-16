@@ -77,8 +77,8 @@ export class MemshareClient {
     return this.signedRequest("POST", "/api/remember/batch", body);
   }
 
-  async recall(body: RecallRequest): Promise<RecallResponse> {
-    return this.signedRequest("POST", "/api/recall", body);
+  async recall(body: RecallRequest, accountIdOverride?: string): Promise<RecallResponse> {
+    return this.signedRequest("POST", "/api/recall", body, accountIdOverride);
   }
 
   private async getPublicKey(): Promise<Uint8Array> {
@@ -92,6 +92,7 @@ export class MemshareClient {
     method: string,
     path: string,
     body: object,
+    accountIdOverride?: string,
   ): Promise<T> {
     const timestamp = Math.floor(Date.now() / 1000).toString();
     const bodyString = JSON.stringify(body);
@@ -110,7 +111,9 @@ export class MemshareClient {
         "x-signature": bytesToHex(signature),
         "x-timestamp": timestamp,
         "x-delegate-key": bytesToHex(this.delegateKey),
-        "x-account-id": this.accountId,
+        // x-account-id hint: tells auth middleware which MemWalAccount to resolve
+        // against. Used for cross-user import when delegate key exists in multiple accounts.
+        "x-account-id": accountIdOverride ?? this.accountId,
       },
       body: bodyString,
     });
