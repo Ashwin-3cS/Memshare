@@ -1,0 +1,3 @@
+display_name: Memshare Import
+short_description: Import or publish Memshare project context with the local CLI.
+default_prompt: Import stored Memshare project context into this Claude session or publish the current session context through the local memshare CLI.
