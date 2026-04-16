@@ -3,6 +3,7 @@ import path from "node:path";
 
 import { attachContext } from "./attach.js";
 import { captureStructuredContext } from "./capture.js";
+import { addDelegateKey } from "./sui.js";
 import {
   type CliConfig,
   getMissingConfigKeys,
@@ -106,6 +107,7 @@ export function printHelp(): void {
   console.log("  publish [--summary <text>] [--context-file <path>] [--stdin]");
   console.log("  import [<project-id>] [--output <dir>] [--tool claude]");
   console.log("  export [<project-id>] [--output <dir>]");
+  console.log("  share --to <0xaddress> --pubkey <hex> [--label <name>]");
   console.log("");
   console.log("Advanced commands:");
   console.log("  capture [--push] [--summary <text>] [--include-detailed-context]");
@@ -248,12 +250,13 @@ export async function runCommand(config: CliConfig, argv: string[]): Promise<num
         : loadProjectConfig(process.cwd());
 
       const namespace = getStringFlag(flags, "namespace") ?? proj.namespace;
+      const fromAccountId = getStringFlag(flags, "from");
       const result = await client.recall({
         query: "project context overview decisions state",
         namespace,
         limit: 100,
         filters: { project_id: proj.projectId },
-      });
+      }, fromAccountId);
 
       const context = rehydrateProjectContext(result);
       const capturedAt = new Date().toISOString().slice(0, 10);
@@ -403,6 +406,28 @@ export async function runCommand(config: CliConfig, argv: string[]): Promise<num
         cwd: process.cwd(),
       });
       console.log(attached.path);
+      return 0;
+    }
+    case "share": {
+      const to = getStringFlag(flags, "to");
+      const pubkey = getStringFlag(flags, "pubkey");
+      if (!to) throw new Error("share requires --to <0xaddress>");
+      if (!pubkey) throw new Error("share requires --pubkey <hex>");
+
+      const label = getStringFlag(flags, "label") ?? to.slice(0, 10);
+      const proj = loadProjectConfig(process.cwd());
+
+      console.log(`Submitting add_delegate_key transaction...`);
+      const digest = await addDelegateKey(config, {
+        friendAddress: to,
+        friendPubkeyHex: pubkey,
+        label,
+      });
+
+      console.log(`Shared.`);
+      console.log(`  TX digest: ${digest}`);
+      console.log(`  Friend can now run:`);
+      console.log(`    memshare import ${proj.projectId} --from ${config.accountId}`);
       return 0;
     }
     default:
