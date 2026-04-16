@@ -1,5 +1,8 @@
+import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
+
+import type { ProjectConfig } from "./types.js";
 
 export type CliConfig = {
   envPath: string;
@@ -66,6 +69,72 @@ export function loadCliConfig(cwd = process.cwd()): CliConfig {
     registryId: env.MEMWAL_REGISTRY_ID ?? null,
     jinaApiKey: env.JINA_API_KEY ?? null,
   };
+}
+
+function tryGitConfig(args: string[], cwd: string): string | null {
+  try {
+    return execFileSync("git", args, {
+      cwd,
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+    }).trim() || null;
+  } catch {
+    return null;
+  }
+}
+
+function deriveProjectId(remoteUrl: string): string {
+  // SSH: git@github.com:owner/repo.git
+  const sshMatch = remoteUrl.match(/[^/:]+\/[^/]+(?:\.git)?$/);
+  if (sshMatch) {
+    return sshMatch[0].replace(/\.git$/, "");
+  }
+  return remoteUrl;
+}
+
+function projectSlug(projectId: string): string {
+  // Last segment: "owner/repo" → "repo"
+  const parts = projectId.split("/");
+  return parts[parts.length - 1] ?? projectId;
+}
+
+export function loadProjectConfig(cwd = process.cwd()): ProjectConfig {
+  const configPath = path.join(
+    tryGitConfig(["rev-parse", "--show-toplevel"], cwd) ?? cwd,
+    ".memshare.json",
+  );
+
+  let stored: Partial<ProjectConfig> = {};
+  if (fs.existsSync(configPath)) {
+    try {
+      stored = JSON.parse(fs.readFileSync(configPath, "utf8")) as Partial<ProjectConfig>;
+    } catch {
+      // ignore malformed file
+    }
+  }
+
+  if (stored.projectId && stored.namespace) {
+    return stored as ProjectConfig;
+  }
+
+  const remoteUrl = tryGitConfig(["remote", "get-url", "origin"], cwd);
+  const repoRoot = tryGitConfig(["rev-parse", "--show-toplevel"], cwd) ?? cwd;
+  const projectId =
+    stored.projectId ??
+    (remoteUrl ? deriveProjectId(remoteUrl) : path.basename(repoRoot));
+  const namespace = stored.namespace ?? projectSlug(projectId);
+
+  return {
+    projectId,
+    namespace,
+    capsuleId: stored.capsuleId,
+  };
+}
+
+export function saveProjectConfig(config: ProjectConfig, cwd = process.cwd()): void {
+  const repoRoot = tryGitConfig(["rev-parse", "--show-toplevel"], cwd) ?? cwd;
+  const configPath = path.join(repoRoot, ".memshare.json");
+  fs.writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`, "utf8");
 }
 
 export function getMissingConfigKeys(config: CliConfig): string[] {

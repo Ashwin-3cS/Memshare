@@ -63,3 +63,19 @@ export type HealthResponse = {
   status: string;
   version: string;
 };
+
+export type ProjectConfig = {
+  projectId: string;
+  namespace: string;
+  capsuleId?: string;
+};
+
+export type ContextFolder = {
+  index: string;
+  overview: string;
+  state: string;
+  decisions: string;
+  nextSteps: string;
+  files: string;
+  git: string;
+};
