@@ -52,10 +52,22 @@ function parseDotEnvFile(filePath: string): Record<string, string> {
   return entries;
 }
 
+export function globalConfigPath(): string {
+  const home = process.env.HOME ?? process.env.USERPROFILE ?? "/tmp";
+  return path.join(home, ".config", "memshare", ".env");
+}
+
 export function loadCliConfig(cwd = process.cwd()): CliConfig {
-  const envPath = path.join(cwd, ".env");
-  const fileEnv = parseDotEnvFile(envPath);
-  const env = { ...fileEnv, ...process.env };
+  // Priority: process.env > cwd/.env > ~/.config/memshare/.env
+  const localEnvPath = path.join(cwd, ".env");
+  const globalEnvPath = globalConfigPath();
+
+  const globalEnv = parseDotEnvFile(globalEnvPath);
+  const localEnv = parseDotEnvFile(localEnvPath);
+  const env = { ...globalEnv, ...localEnv, ...process.env };
+
+  // Report the local path if it exists, otherwise global
+  const envPath = fs.existsSync(localEnvPath) ? localEnvPath : globalEnvPath;
 
   return {
     envPath,

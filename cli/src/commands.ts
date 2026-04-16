@@ -3,10 +3,11 @@ import path from "node:path";
 
 import { attachContext } from "./attach.js";
 import { captureStructuredContext } from "./capture.js";
-import { addDelegateKey } from "./sui.js";
+import { addDelegateKey, derivePublicKeyHex } from "./sui.js";
 import {
   type CliConfig,
   getMissingConfigKeys,
+  globalConfigPath,
   loadProjectConfig,
   saveProjectConfig,
 } from "./config.js";
@@ -104,11 +105,12 @@ export function printHelp(): void {
   console.log("memshare");
   console.log("");
   console.log("Simple commands (auto-detect project from git):");
-  console.log("  init [--relayer-url <url>] [--account-id <id>] ...  (writes .env)");
+  console.log("  init [--global] [--relayer-url <url>] [--account-id <id>] ...  (writes .env)");
   console.log("  publish [--summary <text>] [--context-file <path>] [--stdin]");
   console.log("  import [<project-id>] [--from <account-id>] [--output <dir>] [--tool claude]");
   console.log("  export [<project-id>] [--output <dir>]");
-  console.log("  share --to <0xaddress> --pubkey <hex> [--label <name>]");
+  console.log("  share --pubkey <hex> [--label <name>]");
+  console.log("  whoami");
   console.log("");
   console.log("Advanced commands:");
   console.log("  capture [--push] [--summary <text>] [--include-detailed-context]");
@@ -173,7 +175,9 @@ export async function runCommand(config: CliConfig, argv: string[]): Promise<num
       return 0;
     }
     case "init": {
-      const envPath = path.join(process.cwd(), ".env");
+      const envPath = flags.global
+        ? globalConfigPath()
+        : path.join(process.cwd(), ".env");
       const relayerUrl = getStringFlag(flags, "relayer-url");
       const accountId = getStringFlag(flags, "account-id");
       const delegateKey = getStringFlag(flags, "delegate-key");
@@ -198,6 +202,7 @@ export async function runCommand(config: CliConfig, argv: string[]): Promise<num
         return 1;
       }
 
+      fs.mkdirSync(path.dirname(envPath), { recursive: true });
       fs.writeFileSync(envPath, lines.join("\n") + "\n", "utf8");
       console.log(`Wrote ${envPath}`);
 
@@ -450,18 +455,25 @@ export async function runCommand(config: CliConfig, argv: string[]): Promise<num
       console.log(attached.path);
       return 0;
     }
+    case "whoami": {
+      if (!config.delegateKey) throw new Error("MEMWAL_DELEGATE_KEY not set");
+      const { pubkeyHex, suiAddress } = derivePublicKeyHex(config.delegateKey);
+      console.log(`Delegate public key : ${pubkeyHex}`);
+      console.log(`Sui address         : ${suiAddress}`);
+      console.log(``);
+      console.log(`Share the public key with the account owner so they can run:`);
+      console.log(`  memshare share --pubkey ${pubkeyHex} --label "<your name>"`);
+      return 0;
+    }
     case "share": {
-      const to = getStringFlag(flags, "to");
       const pubkey = getStringFlag(flags, "pubkey");
-      if (!to) throw new Error("share requires --to <0xaddress>");
       if (!pubkey) throw new Error("share requires --pubkey <hex>");
 
-      const label = getStringFlag(flags, "label") ?? to.slice(0, 10);
+      const label = getStringFlag(flags, "label") ?? pubkey.slice(0, 10);
       const proj = loadProjectConfig(process.cwd());
 
       console.log(`Submitting add_delegate_key transaction...`);
       const digest = await addDelegateKey(config, {
-        friendAddress: to,
         friendPubkeyHex: pubkey,
         label,
       });

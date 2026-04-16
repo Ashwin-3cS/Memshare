@@ -1,5 +1,5 @@
 import { SuiJsonRpcClient, getJsonRpcFullnodeUrl } from "@mysten/sui/jsonRpc";
-import { Ed25519Keypair } from "@mysten/sui/keypairs/ed25519";
+import { Ed25519Keypair, Ed25519PublicKey } from "@mysten/sui/keypairs/ed25519";
 import { decodeSuiPrivateKey } from "@mysten/sui/cryptography";
 import { Transaction } from "@mysten/sui/transactions";
 
@@ -22,7 +22,6 @@ function buildKeypair(suiPrivateKey: string): Ed25519Keypair {
 }
 
 export type AddDelegateKeyParams = {
-  friendAddress: string;
   friendPubkeyHex: string;
   label: string;
 };
@@ -39,18 +38,22 @@ export async function addDelegateKey(
   const keypair = buildKeypair(config.suiPrivateKey);
 
   // Decode friend's pubkey from hex to bytes
-  const pubkeyBytes = Array.from(Buffer.from(params.friendPubkeyHex.replace(/^0x/, ""), "hex"));
+  const pubkeyBytes = Buffer.from(params.friendPubkeyHex.replace(/^0x/, ""), "hex");
   if (pubkeyBytes.length !== 32) {
     throw new Error(`Ed25519 public key must be 32 bytes, got ${pubkeyBytes.length}`);
   }
+
+  // Derive Sui address from Ed25519 public key
+  const ed25519PubKey = new Ed25519PublicKey(pubkeyBytes);
+  const friendSuiAddress = ed25519PubKey.toSuiAddress();
 
   const tx = new Transaction();
   tx.moveCall({
     target: `${config.packageId}::account::add_delegate_key`,
     arguments: [
       tx.object(config.accountId),
-      tx.pure.vector("u8", pubkeyBytes),
-      tx.pure.address(params.friendAddress),
+      tx.pure.vector("u8", Array.from(pubkeyBytes)),
+      tx.pure.address(friendSuiAddress),
       tx.pure.string(params.label),
       tx.object(SUI_CLOCK_OBJECT_ID),
     ],
@@ -61,5 +64,19 @@ export async function addDelegateKey(
     transaction: tx,
   });
 
+  if (!result.digest) {
+    throw new Error("Transaction failed: no digest returned");
+  }
   return result.digest;
+}
+
+export function derivePublicKeyHex(delegateKeyHex: string): { pubkeyHex: string; suiAddress: string } {
+  const privkeyBytes = Buffer.from(delegateKeyHex.replace(/^0x/, ""), "hex");
+  // Ed25519: public key is derived synchronously in @mysten/sui via keypair
+  const keypair = Ed25519Keypair.fromSecretKey(privkeyBytes);
+  const pubkey = keypair.getPublicKey();
+  return {
+    pubkeyHex: Buffer.from(pubkey.toRawBytes()).toString("hex"),
+    suiAddress: pubkey.toSuiAddress(),
+  };
 }
