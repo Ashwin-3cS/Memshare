@@ -7,6 +7,7 @@ type CaptureOptions = {
   namespace: string;
   metadata: MemoryMetadata;
   summary?: string;
+  narrativeText?: string;
   includeDetailedContext?: boolean;
   detailedChunkBytes?: number;
 };
@@ -227,6 +228,24 @@ export function captureStructuredContext(options: CaptureOptions): CapturedConte
           tags: [
             ...(options.metadata.tags ?? []),
             `chunk:${index + 1}/${chunks.length}`,
+          ],
+        },
+      });
+    });
+  }
+
+  if (options.narrativeText) {
+    const maxChunkBytes = options.detailedChunkBytes ?? 12_000;
+    const narrativeChunks = chunkTextByBytes(options.narrativeText, maxChunkBytes);
+    narrativeChunks.forEach((chunk, index) => {
+      detailedContext.push({
+        text: `Session context chunk ${index + 1}/${narrativeChunks.length}\n${chunk}`,
+        namespace: options.namespace,
+        metadata: {
+          ...withFactType(options.metadata, "session_context"),
+          tags: [
+            ...(options.metadata.tags ?? []),
+            `chunk:${index + 1}/${narrativeChunks.length}`,
           ],
         },
       });

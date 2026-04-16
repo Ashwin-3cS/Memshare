@@ -1,4 +1,4 @@
-import type { RecallResponse, RecallResult } from "./types.js";
+import type { ContextFolder, RecallResponse, RecallResult } from "./types.js";
 
 type GroupedRecall = {
   summary: RecallResult[];
@@ -6,6 +6,7 @@ type GroupedRecall = {
   projectContext: RecallResult[];
   workingTree: RecallResult[];
   detailedContext: RecallResult[];
+  sessionContext: RecallResult[];
   other: RecallResult[];
 };
 
@@ -15,6 +16,7 @@ export type RehydratedProjectContext = {
   projectContext: string[];
   workingTree: string[];
   detailedContext: string;
+  sessionContext: string;
   raw: RecallResult[];
 };
 
@@ -44,6 +46,7 @@ function groupResults(results: RecallResult[]): GroupedRecall {
     projectContext: [],
     workingTree: [],
     detailedContext: [],
+    sessionContext: [],
     other: [],
   };
 
@@ -64,6 +67,9 @@ function groupResults(results: RecallResult[]): GroupedRecall {
       case "detailed_context_chunk":
         grouped.detailedContext.push(result);
         break;
+      case "session_context":
+        grouped.sessionContext.push(result);
+        break;
       default:
         grouped.other.push(result);
         break;
@@ -71,6 +77,7 @@ function groupResults(results: RecallResult[]): GroupedRecall {
   }
 
   grouped.detailedContext.sort((left, right) => getChunkOrder(left) - getChunkOrder(right));
+  grouped.sessionContext.sort((left, right) => getChunkOrder(left) - getChunkOrder(right));
   return grouped;
 }
 
@@ -80,6 +87,9 @@ export function rehydrateProjectContext(response: RecallResponse): RehydratedPro
   const detailedContext = grouped.detailedContext
     .map((result) => result.text.replace(/^Detailed context chunk \d+\/\d+\n/, ""))
     .join("\n");
+  const sessionContext = grouped.sessionContext
+    .map((result) => result.text.replace(/^Session context chunk \d+\/\d+\n/, ""))
+    .join("\n");
 
   return {
     summary,
@@ -87,6 +97,7 @@ export function rehydrateProjectContext(response: RecallResponse): RehydratedPro
     projectContext: grouped.projectContext.map((result) => result.text),
     workingTree: grouped.workingTree.map((result) => result.text),
     detailedContext,
+    sessionContext,
     raw: response.results,
   };
 }
@@ -134,4 +145,77 @@ export function formatProjectContextArtifact(context: RehydratedProjectContext):
   }
 
   return lines.join("\n").trimEnd();
+}
+
+export function buildContextFolder(
+  context: RehydratedProjectContext,
+  projectId: string,
+  capturedAt: string,
+): ContextFolder {
+  const index = [
+    `# Project Context: ${projectId}`,
+    `Captured: ${capturedAt}`,
+    "",
+    "## Files in this folder",
+    "- overview.md — What the project is, architecture, goals",
+    "- state.md — Current build status, what works, what does not",
+    "- decisions.md — Technical decisions and rationale",
+    "- next-steps.md — Remaining work and open todos",
+    "- files.md — Key files and working tree",
+    "- git.md — Branch, HEAD, remote, recent commits",
+    "",
+    "Read index.md first, then open only the files relevant to your task.",
+  ].join("\n");
+
+  const overviewParts: string[] = [`# Overview: ${projectId}`, ""];
+  if (context.summary) {
+    overviewParts.push("## Summary", context.summary, "");
+  }
+  if (context.sessionContext.trim()) {
+    overviewParts.push("## Project Details", context.sessionContext, "");
+  }
+  const overview = overviewParts.join("\n").trimEnd();
+
+  const stateParts: string[] = ["# Current State", ""];
+  if (context.detailedContext.trim()) {
+    stateParts.push(context.detailedContext, "");
+  }
+  const state = stateParts.join("\n").trimEnd();
+
+  const decisions = [
+    "# Key Decisions",
+    "",
+    context.workingTree.length > 0
+      ? context.workingTree.join("\n")
+      : "_No decision records found._",
+  ].join("\n");
+
+  const nextStepsParts: string[] = ["# Next Steps", ""];
+  for (const item of context.taskSummary) {
+    nextStepsParts.push(`- ${item}`);
+  }
+  if (context.taskSummary.length === 0) {
+    nextStepsParts.push("_No task summary recorded._");
+  }
+  const nextSteps = nextStepsParts.join("\n");
+
+  const filesParts: string[] = ["# Files", ""];
+  for (const item of context.workingTree) {
+    filesParts.push(`- ${item}`);
+  }
+  if (context.workingTree.length === 0) {
+    filesParts.push("_No working tree data recorded._");
+  }
+  const files = filesParts.join("\n");
+
+  const gitParts: string[] = ["# Git State", ""];
+  for (const item of context.projectContext) {
+    gitParts.push(`- ${item}`);
+  }
+  if (context.projectContext.length === 0) {
+    gitParts.push("_No git context recorded._");
+  }
+  const git = gitParts.join("\n");
+
+  return { index, overview, state, decisions, nextSteps, files, git };
 }
