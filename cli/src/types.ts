@@ -32,6 +32,9 @@ export type RememberResponse = {
   owner: string;
   namespace: string;
   metadata: MemoryMetadata;
+  storage_kind?: "blob" | "quilt";
+  quilt_id?: string;
+  quilt_patch_id?: string;
 };
 
 export type RememberBatchResponse = {
@@ -52,6 +55,9 @@ export type RecallResult = {
   text: string;
   distance: number;
   metadata: Record<string, unknown>;
+  storage_kind?: "blob" | "quilt";
+  quilt_id?: string;
+  quilt_patch_id?: string;
 };
 
 export type RecallResponse = {
