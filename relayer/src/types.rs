@@ -177,6 +177,11 @@ pub struct RememberResponse {
     pub owner: String,
     pub namespace: String,
     pub metadata: MemoryMetadata,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quilt_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quilt_patch_id: Option<String>,
+    pub storage_kind: String,
 }
 
 /// POST /api/recall
@@ -223,13 +228,25 @@ pub struct RecallResult {
     pub text: String,
     pub distance: f64,
     pub metadata: Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quilt_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quilt_patch_id: Option<String>,
+    pub storage_kind: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 pub struct SearchHit {
+    /// For storage_kind='blob' this is the Walrus blobId.
+    /// For storage_kind='quilt' this is the parent quilt's blobId (unique patch id lives in quilt_patch_id).
     pub blob_id: String,
     pub distance: f64,
     pub metadata: Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quilt_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quilt_patch_id: Option<String>,
+    pub storage_kind: String,
 }
 
 /// POST /api/analyze
@@ -277,6 +294,7 @@ pub struct RememberManualResponse {
     pub owner: String,
     pub namespace: String,
     pub metadata: MemoryMetadata,
+    pub storage_kind: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

@@ -130,14 +130,26 @@ fn metadata_value(metadata: &MemoryMetadata) -> Result<Value, AppError> {
         .map_err(|e| AppError::Internal(format!("Failed to serialize metadata: {}", e)))
 }
 
-async fn store_memory_fact(
+/// Intermediate per-fact payload produced before any Walrus write occurs.
+/// Same pipeline is used by both the single-blob and quilt paths so embed+encrypt
+/// happen exactly once per fact.
+struct PreparedFact {
+    id: String,
+    text: String,
+    namespace: String,
+    metadata: MemoryMetadata,
+    metadata_json: Value,
+    vector: Vec<f32>,
+    encrypted: Vec<u8>,
+}
+
+async fn prepare_fact(
     state: &Arc<AppState>,
-    auth: &AuthInfo,
     owner: &str,
     text: &str,
     namespace: &str,
     metadata: &MemoryMetadata,
-) -> Result<RememberResponse, AppError> {
+) -> Result<PreparedFact, AppError> {
     let embed_fut = generate_embedding(&state.http_client, &state.config, text);
     let encrypt_fut = seal::seal_encrypt(
         &state.http_client,
@@ -149,6 +161,28 @@ async fn store_memory_fact(
     let (vector_result, encrypted_result) = tokio::join!(embed_fut, encrypt_fut);
     let vector = vector_result?;
     let encrypted = encrypted_result?;
+    let metadata_json = metadata_value(metadata)?;
+
+    Ok(PreparedFact {
+        id: uuid::Uuid::new_v4().to_string(),
+        text: text.to_string(),
+        namespace: namespace.to_string(),
+        metadata: metadata.clone(),
+        metadata_json,
+        vector,
+        encrypted,
+    })
+}
+
+async fn store_memory_fact(
+    state: &Arc<AppState>,
+    auth: &AuthInfo,
+    owner: &str,
+    text: &str,
+    namespace: &str,
+    metadata: &MemoryMetadata,
+) -> Result<RememberResponse, AppError> {
+    let prepared = prepare_fact(state, owner, text, namespace, metadata).await?;
 
     let sui_key = state
         .key_pool
@@ -163,7 +197,7 @@ async fn store_memory_fact(
     let upload_result = walrus::upload_blob(
         &state.http_client,
         &state.config.sidecar_url,
-        &encrypted,
+        &prepared.encrypted,
         50,
         owner,
         &sui_key,
@@ -177,29 +211,130 @@ async fn store_memory_fact(
     .await?;
     let blob_id = upload_result.blob_id;
 
-    let blob_size = encrypted.len() as i64;
-    let id = uuid::Uuid::new_v4().to_string();
-    let metadata_json = metadata_value(metadata)?;
+    let blob_size = prepared.encrypted.len() as i64;
     state
         .db
         .insert_vector(
-            &id,
+            &prepared.id,
             owner,
             namespace,
             &blob_id,
-            &vector,
+            &prepared.vector,
             blob_size,
-            &metadata_json,
+            &prepared.metadata_json,
         )
         .await?;
 
     Ok(RememberResponse {
-        id,
+        id: prepared.id,
         blob_id,
         owner: owner.to_string(),
         namespace: namespace.to_string(),
-        metadata: metadata.clone(),
+        metadata: prepared.metadata,
+        quilt_id: None,
+        quilt_patch_id: None,
+        storage_kind: "blob".to_string(),
     })
+}
+
+/// Upload N prepared facts as a single Walrus Quilt and insert one DB row per patch.
+/// Falls back to per-blob storage for a single-fact batch to avoid quilt overhead.
+async fn store_memory_facts_quilt(
+    state: &Arc<AppState>,
+    auth: &AuthInfo,
+    owner: &str,
+    prepared: Vec<PreparedFact>,
+) -> Result<Vec<RememberResponse>, AppError> {
+    if prepared.is_empty() {
+        return Ok(vec![]);
+    }
+    if prepared.len() == 1 {
+        // One fact isn't worth a quilt — reuse the single-blob path.
+        let p = prepared.into_iter().next().unwrap();
+        let resp = store_memory_fact(state, auth, owner, &p.text, &p.namespace, &p.metadata).await?;
+        return Ok(vec![resp]);
+    }
+
+    // Build QuiltItem per prepared fact. Identifier = internal UUID (unique, quilt-safe).
+    // Tags carry per-patch routing hints so future restore logic can filter by project/capsule/task.
+    let mut items: Vec<walrus::QuiltItem> = Vec::with_capacity(prepared.len());
+    for p in &prepared {
+        let mut tags: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
+        tags.insert("memwal_namespace".into(), p.namespace.clone());
+        tags.insert("memwal_owner".into(), owner.to_string());
+        if let Some(v) = &p.metadata.project_id {
+            tags.insert("memwal_project_id".into(), v.clone());
+        }
+        if let Some(v) = &p.metadata.capsule_id {
+            tags.insert("memwal_capsule_id".into(), v.clone());
+        }
+        if let Some(v) = &p.metadata.task_id {
+            tags.insert("memwal_task_id".into(), v.clone());
+        }
+        items.push(walrus::QuiltItem {
+            identifier: p.id.clone(),
+            data: p.encrypted.clone(),
+            tags,
+        });
+    }
+
+    let upload = walrus::upload_quilt(
+        &state.http_client,
+        &state.config.walrus_publisher_url,
+        items,
+        50,
+        Some(owner),
+    )
+    .await?;
+
+    // Index patches by identifier so we can match rows deterministically.
+    let patch_by_ident: std::collections::HashMap<String, String> = upload
+        .patches
+        .into_iter()
+        .map(|p| (p.identifier, p.patch_id))
+        .collect();
+
+    let quilt_object_id = upload.quilt_object_id.as_deref();
+
+    let mut out = Vec::with_capacity(prepared.len());
+    for p in prepared {
+        let patch_id = patch_by_ident.get(&p.id).cloned().ok_or_else(|| {
+            AppError::Internal(format!(
+                "Walrus quilt response missing patch for identifier {}",
+                p.id
+            ))
+        })?;
+        let blob_size = p.encrypted.len() as i64;
+        state
+            .db
+            .insert_vector_quilt(
+                &p.id,
+                owner,
+                &p.namespace,
+                &upload.quilt_id,
+                &patch_id,
+                quilt_object_id,
+                &p.vector,
+                blob_size,
+                &p.metadata_json,
+            )
+            .await?;
+
+        out.push(RememberResponse {
+            id: p.id,
+            // Surface the parent quilt id in the `blob_id` field for backwards compat with existing
+            // CLI consumers; the true read key is `quilt_patch_id`.
+            blob_id: upload.quilt_id.clone(),
+            owner: owner.to_string(),
+            namespace: p.namespace,
+            metadata: p.metadata,
+            quilt_id: Some(upload.quilt_id.clone()),
+            quilt_patch_id: Some(patch_id),
+            storage_kind: "quilt".to_string(),
+        });
+    }
+
+    Ok(out)
 }
 
 // ============================================================
@@ -267,23 +402,45 @@ pub async fn remember_batch(
         .sum();
     rate_limit::check_storage_quota(&state, owner, total_text_bytes).await?;
 
-    let mut stored = Vec::with_capacity(body.facts.len());
-    for fact in body.facts {
-        if fact.text.is_empty() {
-            return Err(AppError::BadRequest("fact text cannot be empty".into()));
-        }
-        stored.push(
-            store_memory_fact(
-                &state,
-                &auth,
-                owner,
-                &fact.text,
-                &fact.namespace,
-                &fact.metadata,
-            )
-            .await?,
-        );
-    }
+    // Phase 1: embed + SEAL encrypt every fact concurrently — no Walrus writes yet.
+    let prepare_tasks: Vec<_> = body
+        .facts
+        .iter()
+        .map(|fact| {
+            let state = Arc::clone(&state);
+            let owner = owner.to_string();
+            let text = fact.text.clone();
+            let namespace = fact.namespace.clone();
+            let metadata = fact.metadata.clone();
+            async move {
+                if text.is_empty() {
+                    return Err(AppError::BadRequest("fact text cannot be empty".into()));
+                }
+                prepare_fact(&state, &owner, &text, &namespace, &metadata).await
+            }
+        })
+        .collect();
+
+    // Throttle concurrency to 2 — Jina free tier caps at 2 concurrent embedding requests.
+    use futures::stream::{StreamExt, TryStreamExt};
+    let prepared: Vec<PreparedFact> = futures::stream::iter(prepare_tasks)
+        .buffered(2)
+        .try_collect()
+        .await?;
+
+    // Phase 2: upload all prepared facts as ONE Walrus Quilt → 1 Blob object instead of N.
+    // Falls back to single-blob path automatically when batch has only one fact.
+    let stored = store_memory_facts_quilt(&state, &auth, owner, prepared).await?;
+
+    tracing::info!(
+        "remember_batch complete: {} facts stored for owner={} (storage_kind={})",
+        stored.len(),
+        owner,
+        stored
+            .first()
+            .map(|r| r.storage_kind.as_str())
+            .unwrap_or("-")
+    );
 
     Ok(Json(RememberBatchResponse {
         total: stored.len(),
@@ -347,26 +504,60 @@ pub async fn recall(
             let walrus_client = &state.walrus_client;
             let http_client = &state.http_client;
             let sidecar_url = state.config.sidecar_url.clone();
+            let aggregator_url = state.config.walrus_aggregator_url.clone();
             let blob_id = hit.blob_id.clone();
+            let quilt_id = hit.quilt_id.clone();
+            let quilt_patch_id = hit.quilt_patch_id.clone();
+            let storage_kind = hit.storage_kind.clone();
             let distance = hit.distance;
             let metadata = hit.metadata.clone();
             let private_key = private_key.to_string();
             let package_id = state.config.package_id.clone();
             let account_id = auth.account_id.clone();
             async move {
-                // Download encrypted blob from Walrus (native Rust)
-                let encrypted_data = match walrus::download_blob(walrus_client, &blob_id).await {
-                    Ok(data) => data,
-                    Err(AppError::BlobNotFound(msg)) => {
-                        // Blob expired on Walrus — clean up from DB reactively
-                        tracing::warn!("Blob expired, cleaning up: {}", msg);
-                        cleanup_expired_blob(db, &blob_id).await;
-                        return None;
+                // Download encrypted bytes — branch by storage kind.
+                let encrypted_data = match storage_kind.as_str() {
+                    "quilt" => {
+                        let patch_id = match quilt_patch_id.as_deref() {
+                            Some(p) => p,
+                            None => {
+                                tracing::warn!(
+                                    "Row has storage_kind=quilt but no patch id; skipping"
+                                );
+                                return None;
+                            }
+                        };
+                        match walrus::download_quilt_patch(http_client, &aggregator_url, patch_id)
+                            .await
+                        {
+                            Ok(data) => data,
+                            Err(AppError::BlobNotFound(msg)) => {
+                                tracing::warn!("Quilt patch expired, cleaning up: {}", msg);
+                                let _ = db.delete_by_quilt_patch_id(patch_id).await;
+                                return None;
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    "Failed to download quilt patch {}: {}",
+                                    patch_id,
+                                    e
+                                );
+                                return None;
+                            }
+                        }
                     }
-                    Err(e) => {
-                        tracing::warn!("Failed to download blob {}: {}", blob_id, e);
-                        return None;
-                    }
+                    _ => match walrus::download_blob(walrus_client, &blob_id).await {
+                        Ok(data) => data,
+                        Err(AppError::BlobNotFound(msg)) => {
+                            tracing::warn!("Blob expired, cleaning up: {}", msg);
+                            cleanup_expired_blob(db, &blob_id).await;
+                            return None;
+                        }
+                        Err(e) => {
+                            tracing::warn!("Failed to download blob {}: {}", blob_id, e);
+                            return None;
+                        }
+                    },
                 };
                 // Decrypt using SEAL (via sidecar HTTP)
                 match seal::seal_decrypt(
@@ -385,6 +576,9 @@ pub async fn recall(
                             text,
                             distance,
                             metadata,
+                            quilt_id,
+                            quilt_patch_id,
+                            storage_kind,
                         }),
                         Err(e) => {
                             tracing::warn!("Invalid UTF-8 in decrypted data: {}", e);
@@ -401,7 +595,13 @@ pub async fn recall(
                                 blob_id,
                                 e
                             );
-                            cleanup_expired_blob(db, &blob_id).await;
+                            if storage_kind == "quilt" {
+                                if let Some(p) = quilt_patch_id.as_deref() {
+                                    let _ = db.delete_by_quilt_patch_id(p).await;
+                                }
+                            } else {
+                                cleanup_expired_blob(db, &blob_id).await;
+                            }
                         } else {
                             tracing::warn!("Failed to SEAL decrypt blob {}: {}", blob_id, e);
                         }
@@ -523,6 +723,7 @@ pub async fn remember_manual(
         owner: owner.clone(),
         namespace: namespace.clone(),
         metadata: body.metadata,
+        storage_kind: "blob".to_string(),
     }))
 }
 
@@ -878,25 +1079,47 @@ pub async fn ask(
             let walrus_client = &state.walrus_client;
             let http_client = &state.http_client;
             let sidecar_url = state.config.sidecar_url.clone();
+            let aggregator_url = state.config.walrus_aggregator_url.clone();
             let blob_id = hit.blob_id.clone();
+            let quilt_id = hit.quilt_id.clone();
+            let quilt_patch_id = hit.quilt_patch_id.clone();
+            let storage_kind = hit.storage_kind.clone();
             let distance = hit.distance;
             let metadata = hit.metadata.clone();
             let private_key = private_key.to_string();
             let package_id = state.config.package_id.clone();
             let account_id = auth.account_id.clone();
             async move {
-                let encrypted_data = match walrus::download_blob(walrus_client, &blob_id).await {
-                    Ok(data) => data,
-                    Err(AppError::BlobNotFound(msg)) => {
-                        // Blob expired on Walrus — clean up from DB reactively
-                        tracing::warn!("Blob expired, cleaning up: {}", msg);
-                        cleanup_expired_blob(db, &blob_id).await;
-                        return None;
+                let encrypted_data = match storage_kind.as_str() {
+                    "quilt" => {
+                        let patch_id = quilt_patch_id.as_deref()?;
+                        match walrus::download_quilt_patch(http_client, &aggregator_url, patch_id)
+                            .await
+                        {
+                            Ok(data) => data,
+                            Err(AppError::BlobNotFound(msg)) => {
+                                tracing::warn!("Quilt patch expired: {}", msg);
+                                let _ = db.delete_by_quilt_patch_id(patch_id).await;
+                                return None;
+                            }
+                            Err(e) => {
+                                tracing::warn!("Quilt patch download failed {}: {}", patch_id, e);
+                                return None;
+                            }
+                        }
                     }
-                    Err(e) => {
-                        tracing::warn!("Download failed for {}: {}", blob_id, e);
-                        return None;
-                    }
+                    _ => match walrus::download_blob(walrus_client, &blob_id).await {
+                        Ok(data) => data,
+                        Err(AppError::BlobNotFound(msg)) => {
+                            tracing::warn!("Blob expired, cleaning up: {}", msg);
+                            cleanup_expired_blob(db, &blob_id).await;
+                            return None;
+                        }
+                        Err(e) => {
+                            tracing::warn!("Download failed for {}: {}", blob_id, e);
+                            return None;
+                        }
+                    },
                 };
                 match seal::seal_decrypt(
                     http_client,
@@ -914,6 +1137,9 @@ pub async fn ask(
                             text,
                             distance,
                             metadata,
+                            quilt_id,
+                            quilt_patch_id,
+                            storage_kind,
                         }),
                         Err(e) => {
                             tracing::warn!("Invalid UTF-8: {}", e);

@@ -1,5 +1,6 @@
 use crate::types::{AppError, SidecarError};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
+use std::collections::BTreeMap;
 
 /// Result of a Walrus blob upload
 pub struct UploadResult {
@@ -209,6 +210,234 @@ pub async fn query_blobs_by_owner(
     );
 
     Ok(result.blobs)
+}
+
+// ============================================================
+// Quilts (batch N facts into one Walrus Blob object)
+// ============================================================
+
+/// One fact to include in a quilt upload.
+pub struct QuiltItem {
+    /// Unique identifier within the quilt (must not start with `_`).
+    pub identifier: String,
+    /// Raw encrypted bytes for this fact.
+    pub data: Vec<u8>,
+    /// Optional per-patch tags surfaced as HTTP headers on retrieval.
+    pub tags: BTreeMap<String, String>,
+}
+
+pub struct QuiltPatch {
+    pub identifier: String,
+    pub patch_id: String,
+}
+
+pub struct QuiltUploadResult {
+    /// Parent quilt blob id (base64url, content-addressed).
+    pub quilt_id: String,
+    /// Parent Sui Blob object id, if returned by the publisher.
+    #[allow(dead_code)]
+    pub quilt_object_id: Option<String>,
+    pub patches: Vec<QuiltPatch>,
+}
+
+#[derive(serde::Serialize)]
+struct QuiltMetadataEntry<'a> {
+    identifier: &'a str,
+    tags: &'a BTreeMap<String, String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct QuiltStoreResult {
+    blob_store_result: QuiltBlobStoreResult,
+    stored_quilt_blobs: Vec<StoredQuiltBlob>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct QuiltBlobStoreResult {
+    // Publisher returns either `newlyCreated` or `alreadyCertified`; both carry blobObject/blobId.
+    #[serde(default)]
+    newly_created: Option<QuiltNewlyCreated>,
+    #[serde(default)]
+    already_certified: Option<QuiltAlreadyCertified>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct QuiltNewlyCreated {
+    blob_object: QuiltBlobObject,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct QuiltAlreadyCertified {
+    blob_id: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct QuiltBlobObject {
+    id: String,
+    blob_id: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct StoredQuiltBlob {
+    identifier: String,
+    quilt_patch_id: String,
+}
+
+/// Upload multiple encrypted facts as a single Walrus Quilt.
+///
+/// Calls the publisher directly (`PUT /v1/quilts?epochs=N`) with multipart form-data,
+/// one file part per fact + a `_metadata` JSON entry carrying per-identifier tags.
+/// Returns the parent quilt id + per-fact patch ids the DB will store.
+pub async fn upload_quilt(
+    client: &reqwest::Client,
+    publisher_url: &str,
+    items: Vec<QuiltItem>,
+    epochs: u64,
+    send_object_to: Option<&str>,
+) -> Result<QuiltUploadResult, AppError> {
+    if items.is_empty() {
+        return Err(AppError::BadRequest("quilt items cannot be empty".into()));
+    }
+
+    let mut url = format!("{}/v1/quilts?epochs={}", publisher_url.trim_end_matches('/'), epochs);
+    if let Some(addr) = send_object_to {
+        url.push_str(&format!("&send_object_to={}", addr));
+    }
+
+    let metadata: Vec<QuiltMetadataEntry> = items
+        .iter()
+        .filter(|item| !item.tags.is_empty())
+        .map(|item| QuiltMetadataEntry {
+            identifier: &item.identifier,
+            tags: &item.tags,
+        })
+        .collect();
+
+    let mut form = reqwest::multipart::Form::new();
+    for item in &items {
+        if item.identifier.starts_with('_') {
+            return Err(AppError::BadRequest(format!(
+                "quilt identifier must not start with '_': {}",
+                item.identifier
+            )));
+        }
+        let part = reqwest::multipart::Part::bytes(item.data.clone())
+            .file_name(item.identifier.clone())
+            .mime_str("application/octet-stream")
+            .map_err(|e| AppError::Internal(format!("quilt part mime error: {}", e)))?;
+        form = form.part(item.identifier.clone(), part);
+    }
+
+    if !metadata.is_empty() {
+        let meta_json = serde_json::to_string(&metadata)
+            .map_err(|e| AppError::Internal(format!("quilt metadata encode failed: {}", e)))?;
+        form = form.text("_metadata", meta_json);
+    }
+
+    let resp = client
+        .put(&url)
+        .multipart(form)
+        .send()
+        .await
+        .map_err(|e| AppError::Internal(format!("Walrus quilt upload request failed: {}", e)))?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(AppError::Internal(format!(
+            "Walrus quilt upload failed ({}): {}",
+            status, body
+        )));
+    }
+
+    let parsed: QuiltStoreResult = resp
+        .json()
+        .await
+        .map_err(|e| AppError::Internal(format!("Failed to parse quilt response: {}", e)))?;
+
+    let (quilt_id, quilt_object_id) = if let Some(nc) = parsed.blob_store_result.newly_created {
+        (nc.blob_object.blob_id, Some(nc.blob_object.id))
+    } else if let Some(ac) = parsed.blob_store_result.already_certified {
+        (ac.blob_id, None)
+    } else {
+        return Err(AppError::Internal(
+            "Walrus quilt response missing blobStoreResult.newlyCreated/alreadyCertified".into(),
+        ));
+    };
+
+    let patches = parsed
+        .stored_quilt_blobs
+        .into_iter()
+        .map(|p| QuiltPatch {
+            identifier: p.identifier,
+            patch_id: p.quilt_patch_id,
+        })
+        .collect::<Vec<_>>();
+
+    tracing::info!(
+        "walrus quilt upload ok: quilt_id={}, patches={}, object_id={:?}",
+        quilt_id,
+        patches.len(),
+        quilt_object_id
+    );
+
+    Ok(QuiltUploadResult {
+        quilt_id,
+        quilt_object_id,
+        patches,
+    })
+}
+
+/// Download a single quilt patch by its patch id via the aggregator HTTP API.
+pub async fn download_quilt_patch(
+    client: &reqwest::Client,
+    aggregator_url: &str,
+    patch_id: &str,
+) -> Result<Vec<u8>, AppError> {
+    let url = format!(
+        "{}/v1/blobs/by-quilt-patch-id/{}",
+        aggregator_url.trim_end_matches('/'),
+        patch_id
+    );
+
+    let resp = tokio::time::timeout(std::time::Duration::from_secs(10), client.get(&url).send())
+        .await
+        .map_err(|_| AppError::Internal(format!("quilt patch download timed out: {}", patch_id)))?
+        .map_err(|e| AppError::Internal(format!("quilt patch request failed: {}", e)))?;
+
+    let status = resp.status();
+    if status == reqwest::StatusCode::NOT_FOUND {
+        return Err(AppError::BlobNotFound(format!(
+            "Quilt patch {} expired or not found",
+            patch_id
+        )));
+    }
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        return Err(AppError::Internal(format!(
+            "quilt patch download failed ({}): {}",
+            status, body
+        )));
+    }
+
+    let bytes = resp
+        .bytes()
+        .await
+        .map_err(|e| AppError::Internal(format!("quilt patch read failed: {}", e)))?
+        .to_vec();
+
+    tracing::info!(
+        "walrus quilt patch download ok: patch_id={}, {} bytes",
+        patch_id,
+        bytes.len()
+    );
+    Ok(bytes)
 }
 
 /// Download a blob from Walrus via the walrus_rs SDK (Aggregator HTTP API).

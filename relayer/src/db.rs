@@ -43,6 +43,18 @@ impl VectorDb {
             .await
             .map_err(|e| AppError::Internal(format!("Failed to run migration 004: {}", e)))?;
 
+        let migration_005 = include_str!("../migrations/005_quilt_columns.sql");
+        sqlx::raw_sql(migration_005)
+            .execute(&pool)
+            .await
+            .map_err(|e| AppError::Internal(format!("Failed to run migration 005: {}", e)))?;
+
+        let migration_006 = include_str!("../migrations/006_resize_embedding_1024.sql");
+        sqlx::raw_sql(migration_006)
+            .execute(&pool)
+            .await
+            .map_err(|e| AppError::Internal(format!("Failed to run migration 006: {}", e)))?;
+
         tracing::info!("database connected and migrations applied");
 
         Ok(Self { pool })
@@ -87,6 +99,54 @@ impl VectorDb {
         Ok(())
     }
 
+    /// Insert a vector entry backed by a Walrus Quilt patch (N facts share one quilt blob).
+    /// `quilt_id` = parent quilt blobId, `quilt_patch_id` = per-fact patch id used for reads.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn insert_vector_quilt(
+        &self,
+        id: &str,
+        owner: &str,
+        namespace: &str,
+        quilt_id: &str,
+        quilt_patch_id: &str,
+        quilt_object_id: Option<&str>,
+        vector: &[f32],
+        blob_size_bytes: i64,
+        metadata: &Value,
+    ) -> Result<(), AppError> {
+        let embedding = Vector::from(vector.to_vec());
+
+        sqlx::query(
+            "INSERT INTO vector_entries
+                (id, owner, namespace, blob_id, embedding, blob_size_bytes, metadata,
+                 quilt_id, quilt_patch_id, quilt_object_id, storage_kind)
+             VALUES ($1, $2, $3, NULL, $4, $5, $6, $7, $8, $9, 'quilt')",
+        )
+        .bind(id)
+        .bind(owner)
+        .bind(namespace)
+        .bind(embedding)
+        .bind(blob_size_bytes)
+        .bind(metadata)
+        .bind(quilt_id)
+        .bind(quilt_patch_id)
+        .bind(quilt_object_id)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| AppError::Internal(format!("Failed to insert quilt vector: {}", e)))?;
+
+        tracing::debug!(
+            "inserted quilt vector: id={}, quilt_id={}, patch_id={}, owner={}, ns={}, size={}B",
+            id,
+            quilt_id,
+            quilt_patch_id,
+            owner,
+            namespace,
+            blob_size_bytes
+        );
+        Ok(())
+    }
+
     /// Search for similar vectors using pgvector cosine distance (<=>)
     /// Returns blob_id and distance for each match
     pub async fn search_similar(
@@ -99,8 +159,20 @@ impl VectorDb {
     ) -> Result<Vec<SearchHit>, AppError> {
         let embedding = Vector::from(query_vector.to_vec());
 
-        let rows: Vec<(String, f64, Value)> = sqlx::query_as(
-            "SELECT blob_id, (embedding <=> $1)::float8 AS distance, metadata
+        let rows: Vec<(
+            Option<String>,
+            f64,
+            Value,
+            Option<String>,
+            Option<String>,
+            String,
+        )> = sqlx::query_as(
+            "SELECT blob_id,
+                    (embedding <=> $1)::float8 AS distance,
+                    metadata,
+                    quilt_id,
+                    quilt_patch_id,
+                    storage_kind
              FROM vector_entries
              WHERE owner = $2
                AND namespace = $3
@@ -123,11 +195,23 @@ impl VectorDb {
 
         let results = rows
             .into_iter()
-            .map(|(blob_id, distance, metadata)| SearchHit {
-                blob_id,
-                distance,
-                metadata,
-            })
+            .map(
+                |(blob_id, distance, metadata, quilt_id, quilt_patch_id, storage_kind)| {
+                    // For quilts the indexable "blob_id" column is NULL; surface the quilt_id as the
+                    // blob identifier for logs/metadata. Patch id is the actual read key.
+                    let surfaced_blob_id = blob_id
+                        .or_else(|| quilt_id.clone())
+                        .unwrap_or_default();
+                    SearchHit {
+                        blob_id: surfaced_blob_id,
+                        distance,
+                        metadata,
+                        quilt_id,
+                        quilt_patch_id,
+                        storage_kind,
+                    }
+                },
+            )
             .collect();
 
         Ok(results)
@@ -200,6 +284,37 @@ impl VectorDb {
             );
         }
         Ok(rows)
+    }
+
+    /// Delete a single quilt-patch vector entry (used for expired quilt cleanup).
+    pub async fn delete_by_quilt_patch_id(&self, quilt_patch_id: &str) -> Result<u64, AppError> {
+        let result = sqlx::query("DELETE FROM vector_entries WHERE quilt_patch_id = $1")
+            .bind(quilt_patch_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| {
+                AppError::Internal(format!("Failed to delete vector by quilt_patch_id: {}", e))
+            })?;
+        let rows = result.rows_affected();
+        if rows > 0 {
+            tracing::info!(
+                "deleted expired quilt patch from DB: patch_id={}, rows={}",
+                quilt_patch_id,
+                rows
+            );
+        }
+        Ok(rows)
+    }
+
+    /// Delete all vector entries for an expired quilt (parent blob gone).
+    #[allow(dead_code)]
+    pub async fn delete_by_quilt_id(&self, quilt_id: &str) -> Result<u64, AppError> {
+        let result = sqlx::query("DELETE FROM vector_entries WHERE quilt_id = $1")
+            .bind(quilt_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| AppError::Internal(format!("Failed to delete vector by quilt_id: {}", e)))?;
+        Ok(result.rows_affected())
     }
 
     // ============================================================
